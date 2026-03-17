@@ -1,0 +1,21 @@
+// settings.gradle
+pluginManagement {
+    repositories {
+        // 添加 Gradle 官方插件仓库
+        gradlePluginPortal()
+        
+        // 添加 Forge 的 Maven 仓库
+        maven {
+            name = 'MinecraftForge'
+            url = 'https://maven.minecraftforge.net/'
+        }
+    }
+}
+
+// 配置项目
+
+plugins {
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '0.7.0'
+}
+
+//include 'rainjava-agent'//include 'rainjava-core'
