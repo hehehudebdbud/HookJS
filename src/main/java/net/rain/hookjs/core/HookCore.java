@@ -32,7 +32,11 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiConsumer;
 
+import net.rain.hookjs.deobf.*;
+
+import static org.objectweb.asm.Opcodes.AALOAD;
 import static org.objectweb.asm.Opcodes.AASTORE;
+import static org.objectweb.asm.Opcodes.ACONST_NULL;
 import static org.objectweb.asm.Opcodes.ACC_BRIDGE;
 import static org.objectweb.asm.Opcodes.ACC_FINAL;
 import static org.objectweb.asm.Opcodes.ACC_NATIVE;
@@ -45,6 +49,7 @@ import static org.objectweb.asm.Opcodes.ACC_SYNCHRONIZED;
 import static org.objectweb.asm.Opcodes.ACC_SYNTHETIC;
 import static org.objectweb.asm.Opcodes.ACC_VARARGS;
 import static org.objectweb.asm.Opcodes.ALOAD;
+import static org.objectweb.asm.Opcodes.ASTORE;
 import static org.objectweb.asm.Opcodes.ANEWARRAY;
 import static org.objectweb.asm.Opcodes.CHECKCAST;
 import static org.objectweb.asm.Opcodes.DUP;
@@ -104,11 +109,21 @@ public class HookCore {
         Object intercept(T instance, Object[] args, Object originalReturn) throws Throwable;
     }
 
+    public interface ModifyArgsHandler<T> {
+        Object[] modify(T instance, Object[] args) throws Throwable;
+    }
+
+    public interface RedirectHandler<T> {
+        Object redirect(T instance, Object[] args) throws Throwable;
+    }
+
     private enum HookKind {
         HEAD,
         TAIL,
         OVERWRITE,
-        RETURN
+        RETURN,
+        MODIFY_ARGS,
+        REDIRECT
     }
 
     private static class HookConfig {
@@ -161,6 +176,12 @@ public class HookCore {
             }
             if (kind == HookKind.RETURN) {
                 return Type.getDescriptor(ReturnInterceptor.class);
+            }
+            if (kind == HookKind.MODIFY_ARGS) {
+                return Type.getDescriptor(ModifyArgsHandler.class);
+            }
+            if (kind == HookKind.REDIRECT) {
+                return Type.getDescriptor(RedirectHandler.class);
             }
             throw new IllegalStateException("未知 HookKind: " + kind);
         }
@@ -301,6 +322,43 @@ public class HookCore {
                 null, null, null, interceptor, HookKind.RETURN);
     }
 
+    public <T> HookCore modifyArgs(String targetClassName, String targetMethodName,
+            String targetMethodDesc, ModifyArgsHandler<T> handler) {
+        return addHook(targetClassName, targetMethodName, targetMethodDesc,
+                null, null, null, handler, HookKind.MODIFY_ARGS);
+    }
+
+    public <T> HookCore modifyArgs(String targetClassName, String targetMethodName,
+            ModifyArgsHandler<T> handler) {
+        return modifyArgs(targetClassName, targetMethodName, "()V", handler);
+    }
+
+    public HookCore redirect(String targetClassName, String targetMethodName,
+            String targetMethodDesc,
+            String redirectMethodClassName, String redirectMethodName,
+            String redirectMethodDesc) {
+        return addHook(targetClassName, targetMethodName, targetMethodDesc,
+                redirectMethodClassName, redirectMethodName, redirectMethodDesc,
+                null, HookKind.REDIRECT);
+    }
+
+    public HookCore redirect(String targetClassName, String targetMethodName,
+            String redirectMethodClassName, String redirectMethodName) {
+        return redirect(targetClassName, targetMethodName, "()V",
+                redirectMethodClassName, redirectMethodName, "()V");
+    }
+
+    public <T> HookCore redirect(String targetClassName, String targetMethodName,
+            String targetMethodDesc, RedirectHandler<T> handler) {
+        return addHook(targetClassName, targetMethodName, targetMethodDesc,
+                null, null, null, handler, HookKind.REDIRECT);
+    }
+
+    public <T> HookCore redirect(String targetClassName, String targetMethodName,
+            RedirectHandler<T> handler) {
+        return redirect(targetClassName, targetMethodName, "()V", handler);
+    }
+
     private HookCore addHook(String targetClassName, String targetMethodName,
             String targetMethodDesc,
             String hookClassName, String hookMethodName,
@@ -308,6 +366,9 @@ public class HookCore {
             Object callback, HookKind kind) {
 
         String normalizedTargetClass = normalizeClassName(targetClassName);
+        System.out.println("[HookCore]" + targetMethodName);
+        System.out.println("[HookCore]" + MinecraftHelper.findSrgMethodName(normalizedTargetClass, targetMethodName, targetMethodDesc));
+        targetMethodName = MinecraftHelper.findSrgMethodName(normalizedTargetClass, targetMethodName, targetMethodDesc);
         validateMethodDescriptor(targetMethodDesc, "targetMethodDesc");
 
         HookConfig config;
@@ -472,21 +533,40 @@ public class HookCore {
             MethodNode mn = new MethodNode(access, methodName, methodDesc, null, exceptions);
             mn.visitCode();
 
+            List<HookConfig> modifyArgsHooks = filterByKind(configs, HookKind.MODIFY_ARGS);
             List<HookConfig> heads = filterByKind(configs, HookKind.HEAD);
             List<HookConfig> tails = filterByKind(configs, HookKind.TAIL);
             List<HookConfig> overwrites = filterByKind(configs, HookKind.OVERWRITE);
+            List<HookConfig> redirects = filterByKind(configs, HookKind.REDIRECT);
             List<HookConfig> returnHooks = filterByKind(configs, HookKind.RETURN);
-
-            for (HookConfig config : heads) {
-                generateVoidHookInvocation(mn, config, callbackFieldNames, classInternal, argTypes);
-            }
 
             int returnLocal = -1;
             if (returnType.getSort() != Type.VOID) {
                 returnLocal = newLocalIndex(argTypes);
             }
+            int nextLocal = returnType.getSort() != Type.VOID
+                    ? returnLocal + returnType.getSize()
+                    : newLocalIndex(argTypes);
+            int argsArrayLocal = !modifyArgsHooks.isEmpty() ? nextLocal : -1;
 
-            if (!overwrites.isEmpty()) {
+            if (!modifyArgsHooks.isEmpty()) {
+                generateArgsArray(mn, argTypes);
+                mn.visitVarInsn(ASTORE, argsArrayLocal);
+                for (HookConfig config : modifyArgsHooks) {
+                    generateModifyArgsInvocation(mn, config, callbackFieldNames, classInternal, argsArrayLocal);
+                }
+                writeArgsArrayBackToLocals(mn, argTypes, argsArrayLocal);
+            }
+
+            for (HookConfig config : heads) {
+                generateVoidHookInvocation(mn, config, callbackFieldNames, classInternal, argTypes);
+            }
+
+            if (!redirects.isEmpty()) {
+                HookConfig redirect = redirects.get(0);
+                generateRedirectInvocation(mn, redirect, callbackFieldNames, classInternal,
+                        argTypes, returnType, returnLocal);
+            } else if (!overwrites.isEmpty()) {
                 HookConfig overwrite = overwrites.get(0);
                 generateOverwriteInvocation(mn, overwrite, callbackFieldNames, classInternal,
                         argTypes, returnType, returnLocal);
@@ -556,6 +636,98 @@ public class HookCore {
         Type hookReturnType = Type.getReturnType(config.hookMethodDesc);
         if (hookReturnType.getSort() != Type.VOID) {
             discardTopValue(mn, hookReturnType);
+        }
+    }
+
+    private void generateModifyArgsInvocation(MethodNode mn, HookConfig config,
+            Map<String, String> callbackFieldNames, String classInternal, int argsArrayLocal) {
+        if (!config.isCallback()) {
+            throw new IllegalArgumentException("modifyArgs 目前仅支持 ModifyArgsHandler 回调方式");
+        }
+
+        String fieldName = callbackFieldNames.get(config.fieldKey());
+        if (fieldName == null) {
+            throw new IllegalStateException("未找到回调字段: " + config.fieldKey());
+        }
+
+        mn.visitFieldInsn(GETSTATIC, classInternal, fieldName, config.callbackFieldDesc());
+        mn.visitVarInsn(ALOAD, 0);
+        mn.visitVarInsn(ALOAD, argsArrayLocal);
+        mn.visitMethodInsn(INVOKEINTERFACE,
+                Type.getInternalName(ModifyArgsHandler.class),
+                "modify",
+                "(Ljava/lang/Object;[Ljava/lang/Object;)[Ljava/lang/Object;",
+                true);
+        mn.visitInsn(DUP);
+        org.objectweb.asm.Label useOriginal = new org.objectweb.asm.Label();
+        mn.visitJumpInsn(org.objectweb.asm.Opcodes.IFNULL, useOriginal);
+        mn.visitVarInsn(ASTORE, argsArrayLocal);
+        org.objectweb.asm.Label end = new org.objectweb.asm.Label();
+        mn.visitJumpInsn(org.objectweb.asm.Opcodes.GOTO, end);
+        mn.visitLabel(useOriginal);
+        mn.visitInsn(POP);
+        mn.visitLabel(end);
+    }
+
+    private void writeArgsArrayBackToLocals(MethodNode mn, Type[] argTypes, int argsArrayLocal) {
+        int localIndex = 1;
+        for (int i = 0; i < argTypes.length; i++) {
+            Type argType = argTypes[i];
+            mn.visitVarInsn(ALOAD, argsArrayLocal);
+            pushInt(mn, i);
+            mn.visitInsn(AALOAD);
+            if (argType.getSort() == Type.OBJECT || argType.getSort() == Type.ARRAY) {
+                mn.visitInsn(DUP);
+                org.objectweb.asm.Label nonNull = new org.objectweb.asm.Label();
+                mn.visitJumpInsn(org.objectweb.asm.Opcodes.IFNONNULL, nonNull);
+                mn.visitInsn(POP);
+                mn.visitInsn(ACONST_NULL);
+                mn.visitLabel(nonNull);
+                mn.visitTypeInsn(CHECKCAST, argType.getInternalName());
+            } else {
+                emitCastOrUnbox(mn, argType);
+            }
+            mn.visitVarInsn(argType.getOpcode(org.objectweb.asm.Opcodes.ISTORE), localIndex);
+            localIndex += argType.getSize();
+        }
+    }
+
+    private void generateRedirectInvocation(MethodNode mn, HookConfig config,
+            Map<String, String> callbackFieldNames, String classInternal,
+            Type[] argTypes, Type returnType, int returnLocal) {
+        if (config.isCallback()) {
+            String fieldName = callbackFieldNames.get(config.fieldKey());
+            if (fieldName == null) {
+                throw new IllegalStateException("未找到回调字段: " + config.fieldKey());
+            }
+            mn.visitFieldInsn(GETSTATIC, classInternal, fieldName, config.callbackFieldDesc());
+            mn.visitVarInsn(ALOAD, 0);
+            generateArgsArray(mn, argTypes);
+            mn.visitMethodInsn(INVOKEINTERFACE,
+                    Type.getInternalName(RedirectHandler.class),
+                    "redirect",
+                    "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
+                    true);
+
+            if (returnType.getSort() == Type.VOID) {
+                mn.visitInsn(POP);
+            } else {
+                emitCastOrUnbox(mn, returnType);
+                mn.visitVarInsn(returnType.getOpcode(org.objectweb.asm.Opcodes.ISTORE), returnLocal);
+            }
+            return;
+        }
+
+        loadMethodArguments(mn, argTypes);
+        mn.visitMethodInsn(INVOKESTATIC, config.hookClassName.replace('.', '/'), config.hookMethodName,
+                config.hookMethodDesc, false);
+        if (returnType.getSort() == Type.VOID) {
+            Type hookReturnType = Type.getReturnType(config.hookMethodDesc);
+            if (hookReturnType.getSort() != Type.VOID) {
+                discardTopValue(mn, hookReturnType);
+            }
+        } else {
+            mn.visitVarInsn(returnType.getOpcode(org.objectweb.asm.Opcodes.ISTORE), returnLocal);
         }
     }
 
@@ -747,15 +919,23 @@ public class HookCore {
             throws ClassNotFoundException, NoSuchMethodException {
         for (MethodPlan plan : methodPlans) {
             int overwriteCount = 0;
+            int redirectCount = 0;
             for (HookConfig config : plan.configs) {
                 if (config.kind == HookKind.OVERWRITE) {
                     overwriteCount++;
+                }
+                if (config.kind == HookKind.REDIRECT) {
+                    redirectCount++;
                 }
                 if (config.kind == HookKind.RETURN
                         && Type.getReturnType(config.targetMethodDesc).getSort() == Type.VOID) {
                     throw new IllegalArgumentException("void 方法不能使用 injectReturn: "
                             + plan.method.getDeclaringClass().getName() + "."
                             + plan.method.getName() + config.targetMethodDesc);
+                }
+
+                if (config.kind == HookKind.MODIFY_ARGS && !config.isCallback()) {
+                    throw new IllegalArgumentException("modifyArgs 目前仅支持回调方式");
                 }
 
                 if (config.isCallback()) {
@@ -777,13 +957,19 @@ public class HookCore {
                 Type targetMethodType = Type.getMethodType(config.targetMethodDesc);
                 Type hookMethodType = Type.getMethodType(config.hookMethodDesc);
                 if (!targetMethodType.equals(hookMethodType)) {
-                    throw new IllegalArgumentException("静态 Hook 方法签名必须与目标方法一致: target="
+                    throw new IllegalArgumentException("静态 Hook/Redirect 方法签名必须与目标方法一致: target="
                             + config.targetMethodDesc + ", hook=" + config.hookMethodDesc);
                 }
             }
 
             if (overwriteCount > 1) {
                 throw new IllegalArgumentException("同一方法最多只能注册一个 overwrite: " + plan.method);
+            }
+            if (redirectCount > 1) {
+                throw new IllegalArgumentException("同一方法最多只能注册一个 redirect: " + plan.method);
+            }
+            if (overwriteCount > 0 && redirectCount > 0) {
+                throw new IllegalArgumentException("同一方法不能同时注册 overwrite 和 redirect: " + plan.method);
             }
         }
     }
